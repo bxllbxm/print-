@@ -1,0 +1,58 @@
+/* ScriptUI native modal; no network, no automatic artwork modification. */
+function runPrintPreflight() {
+    var name=String(app.name), isID=/indesign/i.test(name), isAI=/illustrator/i.test(name);
+    if(!isID && !isAI) {alert('InDesign 또는 Illustrator 안에서 실행해 주세요.');return;}
+    if(app.documents.length===0) {alert('점검할 인쇄 문서를 먼저 열어 주세요.\n그다음 LAYA 인쇄 점검을 다시 실행하세요.');return;}
+    var doc=app.activeDocument;
+    var setup=new Window('dialog','LAYA 인쇄 점검 — 기준 설정');
+    setup.orientation='column';setup.alignChildren='fill';setup.spacing=12;setup.margins=18;
+    setup.add('statictext',undefined,'현재 열린 원본을 읽어 8가지 인쇄 유의사항을 점검합니다.');
+    setup.add('statictext',undefined,'인쇄소 기준을 입력하세요. 빈칸 항목은 직접 확인할 사항으로 남습니다.');
+    function field(label,value) {var g=setup.add('group');g.add('statictext',undefined,label).preferredSize.width=200;var t=g.add('edittext',undefined,value);t.characters=16;return t;}
+    var safety=field('안전 여백 (mm, 원문 3–5)', '3');
+    var bleed=field('인쇄소 도련 폭 (mm, 선택)', '');
+    var small=field('작은 글자 크기 (pt, 선택)', '');
+    var ppi=field('최소 유효 이미지 PPI', '300');
+    var spots=field('의도된 별색 이름 (쉼표 구분)', '');
+    var g=setup.add('group');g.add('statictext',undefined,'납품 방식').preferredSize.width=200;
+    var delivery=g.add('dropdownlist',undefined,['인쇄용 PDF','PDF 외 낱장 표지·명함 원본','그 밖의 원본']);delivery.selection=0;
+    var buttons=setup.add('group');buttons.alignment='right';buttons.add('button',undefined,'취소',{name:'cancel'});var start=buttons.add('button',undefined,'점검 시작',{name:'ok'});
+    var job=null;
+    function clean(s) {return String(s).replace(/^\s+|\s+$/g,'');}
+    function number(t,optional,zero) {var s=clean(t.text);if(s==='' && optional)return null;var n=Number(s);if(s==='' || !isFinite(n) || (zero?n<0:n<=0))throw Error('숫자 입력을 확인해 주세요.');return n;}
+    start.onClick=function() {try{
+        var allowed=[],arr=clean(spots.text).split(','),i;
+        for(i=0;i<arr.length;i++) if(clean(arr[i])!=='')allowed.push(clean(arr[i]));
+        job={safetyMm:number(safety,false,true),bleedMm:number(bleed,true,true),smallTextPt:number(small,true,false),minPpi:number(ppi,false,false),allowedSpots:allowed,delivery:['pdf','singleOriginal','otherOriginal'][delivery.selection.index]};
+        setup.close(1);
+    }catch(e){alert(e.message);}};
+    if(setup.show()!==1 || !job) return;
+    var snapshot,result;
+    try {snapshot=isID?collectInDesign(doc):collectIllustrator(doc);result=evaluatePreflight(snapshot,job);}
+    catch(e) {alert('점검을 완료하지 못했습니다.\n'+e.message+'\n원본의 자동 수정을 시도하지 않았습니다.');return;}
+    var win=new Window('dialog','LAYA 인쇄 점검 — '+snapshot.documentName);
+    win.orientation='column';win.alignChildren='fill';win.spacing=10;win.margins=16;
+    win.add('statictext',undefined,'원본 부분 점검 · 최종 PDF와 인쇄소 사양의 추가 확인이 필요합니다.');
+    var list=win.add('listbox',undefined,[],{numberOfColumns:2,showHeaders:true,columnTitles:['점검 항목','상태'],columnWidths:[340,115]});list.preferredSize=[640,190];
+    var i,entry;for(i=0;i<result.rules.length;i++) {entry=list.add('item',(i+1)+'. '+result.rules[i].title);entry.subItems[0].text=result.rules[i].status;}
+    var extra=list.add('item','추가 점검 · 검사 범위');extra.subItems[0].text='확인 필요';
+    var detail=win.add('edittext',undefined,'',{multiline:true,readonly:true,scrolling:true});detail.preferredSize=[640,230];
+    list.onChange=function(){var index=list.selection?list.selection.index:0,a,j,lines=[];
+        if(index<8) {a=result.rules[index];lines.push(a.title+' — '+a.status,'');for(j=0;j<a.details.length;j++)lines.push(a.details[j]);}
+        else {for(j=0;j<result.extra.length;j++)lines.push('['+result.extra[j].severity+'] '+result.extra[j].message);for(j=0;j<result.coverage.length;j++)lines.push(result.coverage[j]);lines.push('최종 PDF의 글꼴 포함·분판·도련 채움을 별도로 확인하세요.');}
+        detail.text=lines.join('\n');
+    };list.selection=0;list.onChange();
+    var footer=win.add('group');footer.alignment='right';
+    var save=footer.add('button',undefined,'보고서 저장');footer.add('button',undefined,'닫기',{name:'ok'});
+    save.onClick=function(){
+        var file=File.saveDialog('점검 보고서를 TXT로 저장','텍스트 파일:*.txt');if(!file)return;
+        if(!/\.txt$/i.test(file.name)){alert('원본 보호를 위해 .txt 파일로만 보고서를 저장합니다.');return;}
+        try {if(doc.saved && String(file.fsName)===String(doc.fullName.fsName)){alert('원본 파일에는 보고서를 저장할 수 없습니다.');return;}}catch(ignore){}
+        if(file.exists && !confirm('같은 이름의 보고서가 있습니다. 덮어쓸까요?'))return;
+        file.encoding='UTF-8';if(!file.open('w')){alert('파일을 저장할 수 없습니다. 다른 위치를 선택해 주세요.');return;}
+        try {file.write('\uFEFF'+preflightReportText(result));}finally{file.close();}
+        alert('점검 보고서를 저장했습니다.');
+    };
+    win.show();
+}
+if(typeof app!=='undefined') runPrintPreflight();

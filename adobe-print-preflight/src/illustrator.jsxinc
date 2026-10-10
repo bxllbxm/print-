@@ -1,0 +1,302 @@
+/* Read-only Illustrator collector. ES3 syntax for ExtendScript. */
+function collectIllustrator(doc) {
+    var out = { host: "Illustrator", documentName: "", pages: [], items: [], texts: [], images: [], spots: [], fonts: [], extra: [], coverage: [], imageCoverageComplete: false };
+    var visited = [], noticeKeys = {}, fontNames = {}, spotNames = {}, pageLabels = {};
+    var scannedCharacters = 0, characterLimit = 30000, capped = false;
+    var edgeTolerancePt = 5 * 72 / 25.4;
+
+    function get(object, property) {
+        try { return object === null || object === undefined ? undefined : object[property]; }
+        catch (error) { return undefined; }
+    }
+    function length(collection) {
+        var n = get(collection, "length");
+        return typeof n === "number" && isFinite(n) && n >= 0 ? Math.floor(n) : 0;
+    }
+    function number(value) {
+        return typeof value === "number" && isFinite(value) ? value : null;
+    }
+    function string(value, fallback) {
+        try { return value === undefined || value === null || value === "" ? fallback : String(value); }
+        catch (error) { return fallback; }
+    }
+    function notice(severity, message) {
+        var key = "$" + severity + ":" + message;
+        if (!noticeKeys[key]) { noticeKeys[key] = true; out.extra.push({ severity: severity, message: message }); }
+    }
+    function bounds(value) {
+        if (length(value) !== 4) { return null; }
+        var left = number(get(value, 0)), top = number(get(value, 1));
+        var right = number(get(value, 2)), bottom = number(get(value, 3));
+        if (left === null || top === null || right === null || bottom === null) { return null; }
+        return [Math.min(-top, -bottom), Math.min(left, right), Math.max(-top, -bottom), Math.max(left, right)];
+    }
+    function itemBounds(item) { return bounds(get(item, "visibleBounds")) || bounds(get(item, "geometricBounds")); }
+    function intersects(a, b) { return a[1] <= b[3] && a[3] >= b[1] && a[0] <= b[2] && a[2] >= b[0]; }
+    function label(item, fallback) { return string(get(item, "name"), fallback); }
+    function typename(item) { return string(get(item, "typename"), "Unknown"); }
+    function unknownInk() { return { space: "Unknown", values: [], name: "" }; }
+    function componentValues(color, properties) {
+        var values = [], i, value;
+        for (i = 0; i < properties.length; i += 1) {
+            value = number(get(color, properties[i]));
+            if (value === null) { return null; }
+            values.push(value);
+        }
+        return values;
+    }
+    function addSpot(name) {
+        if (!name) { return; }
+        var key = "$" + name;
+        if (!spotNames[key]) { spotNames[key] = true; out.spots.push({ name: name, used: null }); }
+    }
+    function spotModel(spot) {
+        var model = get(spot, "colorType"), names = ["PROCESS", "SPOT", "REGISTRATION"], i;
+        for (i = 0; i < names.length; i += 1) {
+            try {
+                if (typeof ColorModel !== "undefined" && ColorModel[names[i]] !== undefined && model === ColorModel[names[i]]) { return names[i]; }
+            } catch (error) {}
+        }
+        var name = string(model, "").toUpperCase().replace(/^COLORMODEL\./, "");
+        if (name === "PROCESS" || name === "SPOT" || name === "REGISTRATION") { return name; }
+        return "Unknown";
+    }
+    function inventorySpot(spot, index) {
+        var name = string(get(spot, "name"), "견본 " + (index + 1)), model = spotModel(spot);
+        if (model === "SPOT") { addSpot(name); }
+        else if (model === "REGISTRATION") { notice("확인 필요", name + ": 레지스트레이션(Registration) 견본입니다. 실제 사용 여부와 모든 잉크판 출력을 확인하세요."); }
+        else if (model === "Unknown") { notice("확인 필요", name + ": colorType 색상 모델을 읽지 못해 프로세스·별색·레지스트레이션을 구분할 수 없습니다."); }
+    }
+    function readInk(color, objectLabel, depth) {
+        depth = typeof depth === "number" ? depth : 0;
+        if (depth > 8) { notice("확인 필요", objectLabel + ": 색상 참조가 너무 깊거나 반복되어 실제 잉크를 읽지 못했습니다."); return unknownInk(); }
+        var type = typename(color), values, name = "";
+        if (type === "NoColor") { return { space: "None", values: [], name: "" }; }
+        if (type === "CMYKColor") {
+            values = componentValues(color, ["cyan", "magenta", "yellow", "black"]);
+            if (values) { return { space: "CMYK", values: values, name: "" }; }
+        } else if (type === "RGBColor") {
+            values = componentValues(color, ["red", "green", "blue"]);
+            if (values) { return { space: "RGB", values: values, name: "" }; }
+        } else if (type === "GrayColor") {
+            values = componentValues(color, ["gray"]);
+            if (values) { return { space: "Gray", values: values, name: "" }; }
+        } else if (type === "SpotColor") {
+            var spot = get(color, "spot"), model = spotModel(spot);
+            name = string(get(spot, "name"), "");
+            if (model === "REGISTRATION") {
+                notice("주의", objectLabel + ": 레지스트레이션(Registration) 색상 " + name + "을 사용합니다. 일반 검정 잉크로 판정하지 않으며 모든 잉크판 출력을 확인하세요.");
+                return unknownInk();
+            }
+            if (model === "Unknown") {
+                notice("확인 필요", objectLabel + ": " + name + "의 colorType 색상 모델을 읽지 못해 실제 잉크를 판정할 수 없습니다.");
+                return unknownInk();
+            }
+            values = componentValues(color, ["tint"]);
+            if (model === "SPOT") { addSpot(name); }
+            if (!values || values[0] < 0 || values[0] > 100) {
+                notice("확인 필요", objectLabel + ": " + name + "의 틴트 농도(tint)를 읽지 못했거나 0–100% 범위를 벗어납니다.");
+                return unknownInk();
+            }
+            if (model === "SPOT") { return { space: "Spot", values: values, name: name }; }
+            var base = readInk(get(spot, "color"), objectLabel, depth + 1), tinted = [], factor = values[0] / 100, i;
+            if (base.space === "CMYK" || base.space === "RGB") {
+                for (i = 0; i < base.values.length; i += 1) {
+                    tinted.push(base.space === "RGB" ? 255 - (255 - base.values[i]) * factor : base.values[i] * factor);
+                }
+                return { space: base.space, values: tinted, name: base.name };
+            }
+            notice("확인 필요", objectLabel + ": 글로벌 프로세스 색상 " + name + "의 실제 잉크와 틴트 농도는 원본 및 분판에서 확인하세요.");
+            return unknownInk();
+        } else if (type === "GradientColor") {
+            notice("확인 필요", objectLabel + ": 그라디언트(Gradient) 내부 색상과 별색은 원본 및 최종 PDF에서 확인하세요.");
+            return unknownInk();
+        } else if (type === "PatternColor") {
+            notice("확인 필요", objectLabel + ": 패턴(Pattern) 내부 색상과 별색은 원본 및 최종 PDF에서 확인하세요.");
+            return unknownInk();
+        }
+        notice("확인 필요", objectLabel + ": 일부 색상 값을 읽을 수 없어 색상과 분판 확인이 필요합니다.");
+        return unknownInk();
+    }
+    function hasVisibleStroke(item, itemLabel) {
+        if (get(item, "stroked") !== true) { return false; }
+        var ink = readInk(get(item, "strokeColor"), itemLabel);
+        return ink.space !== "None" && ink.space !== "Unknown";
+    }
+    function inspectShapeInk(color, itemLabel) {
+        var ink = readInk(color, itemLabel);
+        if (ink.space === "RGB") { notice("주의", itemLabel + ": 실제 경로 채움 또는 획에 RGB 색상이 있습니다. 최종 CMYK 변환 결과를 확인하세요."); }
+        if (ink.space === "Spot") { notice("확인 필요", itemLabel + ": 실제 경로 채움 또는 획에 별색 " + ink.name + "이 있습니다. 의도된 별색·후가공 용도와 최종 분판을 확인하세요."); }
+    }
+    function straightRectangle(item, box) {
+        if (typename(item) !== "PathItem" || get(item, "closed") !== true || !box) { return false; }
+        var points = get(item, "pathPoints"), corners = {}, i, p, anchor, left, right, x, y, sideX, sideY, key;
+        if (length(points) !== 4 || box[1] === box[3] || box[0] === box[2]) { return false; }
+        for (i = 0; i < 4; i += 1) {
+            p = get(points, i); anchor = get(p, "anchor"); left = get(p, "leftDirection"); right = get(p, "rightDirection");
+            if (length(anchor) !== 2 || length(left) !== 2 || length(right) !== 2) { return false; }
+            x = number(get(anchor, 0)); y = number(get(anchor, 1));
+            if (x === null || y === null) { return false; }
+            if (get(left, 0) !== x || get(left, 1) !== y || get(right, 0) !== x || get(right, 1) !== y) { return false; }
+            sideX = Math.abs(x - box[1]) <= 0.01 ? 0 : (Math.abs(x - box[3]) <= 0.01 ? 1 : -1);
+            sideY = Math.abs(-y - box[0]) <= 0.01 ? 0 : (Math.abs(-y - box[2]) <= 0.01 ? 1 : -1);
+            if (sideX < 0 || sideY < 0) { return false; }
+            key = "$" + sideX + ":" + sideY;
+            if (corners[key]) { return false; }
+            corners[key] = true;
+        }
+        /* The corner sequence must be perimeter edges, not a crossed bow-tie. */
+        for (i = 0; i < 4; i += 1) {
+            anchor = get(get(points, i), "anchor"); p = get(get(points, (i + 1) % 4), "anchor");
+            if (get(anchor, 0) !== get(p, 0) && get(anchor, 1) !== get(p, 1)) { return false; }
+        }
+        return true;
+    }
+    function borderNearPage(item, box, pageBox, strokePt, itemLabel) {
+        if (strokePt === null || strokePt <= 0 || !hasVisibleStroke(item, itemLabel) || !straightRectangle(item, box)) { return false; }
+        var i;
+        for (i = 0; i < 4; i += 1) { if (Math.abs(box[i] - pageBox[i]) > edgeTolerancePt) { return false; } }
+        return true;
+    }
+    function addFont(font, objectLabel) {
+        var name = string(get(font, "name"), "");
+        if (!name) { notice("확인 필요", objectLabel + ": 폰트 이름을 읽지 못했습니다. 누락·대체 폰트를 확인하세요."); return ""; }
+        var key = "$" + name;
+        if (!fontNames[key]) { fontNames[key] = true; out.fonts.push({ name: name, status: "unknown", embedAllowed: null }); }
+        return name;
+    }
+    function inkKey(ink) { return ink.space + ":" + ink.values.join(",") + ":" + ink.name; }
+    function collectText(frame, frameLabel) {
+        var chars = get(frame, "characters"), count = length(chars), i, attrs, fill, stroke, size, font, key, previous = null;
+        if (!chars) { notice("확인 필요", frameLabel + ": 문자 속성을 읽지 못했습니다. 실제 글자 색상과 크기를 확인하세요."); return; }
+        for (i = 0; i < count; i += 1) {
+            if (scannedCharacters >= characterLimit) { capped = true; break; }
+            scannedCharacters += 1;
+            attrs = get(get(chars, i), "characterAttributes");
+            fill = readInk(get(attrs, "fillColor"), frameLabel);
+            stroke = readInk(get(attrs, "strokeColor"), frameLabel);
+            size = number(get(attrs, "size"));
+            if (size === null) { notice("확인 필요", frameLabel + ": 일부 글자 크기를 읽지 못했습니다."); }
+            font = addFont(get(attrs, "textFont"), frameLabel);
+            key = String(size) + "|" + inkKey(fill) + "|" + inkKey(stroke) + "|" + font;
+            if (key !== previous) { out.texts.push({ label: frameLabel + " 문자 " + (i + 1), sizePt: size, ink: fill, strokeInk: stroke }); }
+            previous = key;
+        }
+    }
+    function imageSpace(value) {
+        try {
+            if (typeof ImageColorSpace !== "undefined") {
+                if (ImageColorSpace.CMYK !== undefined && value === ImageColorSpace.CMYK) { return "CMYK"; }
+                if (ImageColorSpace.RGB !== undefined && value === ImageColorSpace.RGB) { return "RGB"; }
+                if (ImageColorSpace.GrayScale !== undefined && value === ImageColorSpace.GrayScale) { return "Gray"; }
+                if (ImageColorSpace.Grayscale !== undefined && value === ImageColorSpace.Grayscale) { return "Gray"; }
+            }
+        } catch (error) {}
+        var text = string(value, "").toUpperCase().replace(/^IMAGECOLORSPACE\./, "");
+        if (text === "CMYK") { return "CMYK"; }
+        if (text === "RGB") { return "RGB"; }
+        if (text === "GRAY" || text === "GREY" || text === "GRAYSCALE" || text === "GREYSCALE") { return "Gray"; }
+        return "Unknown";
+    }
+    function placedVector(item) {
+        var fileName = string(get(get(item, "file"), "name"), "");
+        return /\.(pdf|eps|svg|svgz|ai)$/i.test(fileName);
+    }
+    function collectItem(item, index) {
+        if (!item) { return; }
+        var i;
+        for (i = 0; i < visited.length; i += 1) { if (visited[i] === item) { return; } }
+        visited.push(item);
+        var type = typename(item), itemLabel = label(item, type + " " + (index + 1));
+        var box = itemBounds(item), geometricBox = bounds(get(item, "geometricBounds")), kind = "other", strokePt = null, assigned = false, page;
+        if (type === "TextFrame") { kind = "text"; collectText(item, itemLabel); }
+        else if (type === "PathItem" || type === "CompoundPathItem") { kind = "shape"; }
+        else if (type === "RasterItem") { kind = "image"; }
+        else if (type === "PlacedItem" && !placedVector(item)) { kind = "image"; }
+        if (type === "PathItem") {
+            if (get(item, "stroked") === true) { strokePt = number(get(item, "strokeWidth")); inspectShapeInk(get(item, "strokeColor"), itemLabel); }
+            else if (get(item, "stroked") === false) { strokePt = 0; }
+            if (get(item, "filled") === true) { inspectShapeInk(get(item, "fillColor"), itemLabel); }
+        }
+        if (!box) { notice("확인 필요", itemLabel + ": 객체 경계를 읽지 못해 재단 거리와 아트보드 배치를 확인할 수 없습니다."); }
+        for (i = 0; i < out.pages.length; i += 1) {
+            page = out.pages[i];
+            if (box && intersects(box, page.boundsPt)) {
+                out.items.push({ label: itemLabel, pageLabel: page.label, boundsPt: box, kind: kind, strokePt: strokePt,
+                    borderCandidate: borderNearPage(item, geometricBox, page.boundsPt, strokePt, itemLabel) });
+                assigned = true;
+            }
+        }
+        if (!assigned) { out.items.push({ label: itemLabel, pageLabel: null, boundsPt: box, kind: kind, strokePt: strokePt, borderCandidate: false }); }
+        if (type === "RasterItem") {
+            var space = imageSpace(get(item, "imageColorSpace"));
+            if (space === "Unknown") { space = imageSpace(get(item, "rasterImageColorSpace")); }
+            out.images.push({ label: itemLabel, ppi: null, space: space });
+            notice("확인 필요", itemLabel + ": Illustrator 스크립트로 최종 배치의 유효 PPI를 확인할 수 없습니다. 원본 픽셀 수와 배치 크기로 해상도를 확인하세요.");
+            if (space === "Unknown") { notice("확인 필요", itemLabel + ": 래스터 이미지 색 공간을 읽지 못했습니다. CMYK 변환 여부를 확인하세요."); }
+        } else if (type === "PlacedItem") {
+            if (placedVector(item)) {
+                notice("확인 필요", itemLabel + ": 배치된 PDF/EPS/SVG/AI의 내부 벡터·텍스트·이미지 색상과 해상도는 별도 확인이 필요합니다.");
+            } else {
+                out.images.push({ label: itemLabel, ppi: null, space: "Unknown" });
+                notice("확인 필요", itemLabel + ": 배치 파일의 픽셀 수·유효 PPI와 색 공간은 스크립트로 확인할 수 없습니다. 원본 및 최종 출력 파일에서 확인하세요.");
+            }
+        } else if (type === "MeshItem" || type === "SymbolItem" || type === "PluginItem" || type === "NonNativeItem" || type === "GraphItem") {
+            notice("확인 필요", itemLabel + ": " + type + " 내부 색상·별색·이미지·효과는 자동 수집 범위 밖이므로 별도 확인하세요.");
+        } else if (kind === "other" && type !== "GroupItem") {
+            notice("확인 필요", itemLabel + ": 미지원 객체 유형 " + type + "의 색상과 출력 상태를 확인하세요.");
+        }
+        if (get(item, "clipping") === true || get(item, "clipped") === true) {
+            notice("확인 필요", itemLabel + ": 클리핑 경계와 실제 보이는 내용의 재단·도련 범위를 확인하세요.");
+        }
+        if (type === "GroupItem") { collectCollection(get(item, "pageItems"), itemLabel + " 내부 객체"); }
+        if (type === "CompoundPathItem") { collectCollection(get(item, "pathItems"), itemLabel + " 내부 경로"); }
+    }
+    function collectCollection(collection, collectionLabel) {
+        if (!collection || number(get(collection, "length")) === null) {
+            notice("확인 필요", collectionLabel + ": 객체 목록을 읽지 못했습니다. 해당 내용은 검사되지 않았으므로 원본에서 확인하세요.");
+            return;
+        }
+        var count = length(collection), i;
+        for (i = 0; i < count; i += 1) {
+            var item = get(collection, i);
+            if (!item) { notice("확인 필요", collectionLabel + " " + (i + 1) + ": 객체를 읽지 못했습니다."); }
+            else { collectItem(item, i); }
+        }
+    }
+
+    out.documentName = string(get(doc, "name"), "이름 없는 문서");
+    var artboards = get(doc, "artboards"), count = length(artboards), i, board, boardBounds;
+    for (i = 0; i < count; i += 1) {
+        board = get(artboards, i); boardBounds = bounds(get(board, "artboardRect"));
+        if (boardBounds) {
+            var boardLabel = label(board, "아트보드 " + (i + 1));
+            while (pageLabels["$" + boardLabel]) { boardLabel += " (아트보드 " + (i + 1) + ")"; }
+            pageLabels["$" + boardLabel] = true;
+            out.pages.push({ label: boardLabel, boundsPt: boardBounds, bleedPt: null });
+        }
+        else { notice("확인 필요", "아트보드 " + (i + 1) + ": 경계를 읽지 못했습니다."); }
+    }
+    if (count === 0) { notice("확인 필요", "아트보드 경계를 읽지 못했습니다."); }
+    var documentSpace = get(doc, "documentColorSpace"), rgbDocument = false;
+    try { rgbDocument = typeof DocumentColorSpace !== "undefined" && DocumentColorSpace.RGB !== undefined && documentSpace === DocumentColorSpace.RGB; }
+    catch (error) {}
+    if (string(documentSpace, "").toUpperCase().replace(/^DOCUMENTCOLORSPACE\./, "") === "RGB") { rgbDocument = true; }
+    if (rgbDocument) { notice("주의", "RGB 문서 모드입니다. 문서 모드와 별도로 실제 객체 색상 및 최종 PDF의 CMYK 변환 결과를 확인하세요."); }
+    var spots = get(doc, "spots");
+    for (i = 0; i < length(spots); i += 1) { inventorySpot(get(spots, i), i); }
+    collectCollection(get(doc, "pageItems"), "전체 객체");
+    collectCollection(get(doc, "textFrames"), "텍스트 프레임");
+    collectCollection(get(doc, "rasterItems"), "래스터 객체");
+    collectCollection(get(doc, "placedItems"), "배치 객체");
+    if (capped) { notice("확인 필요", "문자 검사 제한 30000자에 도달했습니다. 검사하지 못한 나머지 글자의 크기·잉크·폰트를 원본에서 확인하세요."); }
+    out.coverage.push("아트보드 경계를 재단선 후보로 사용합니다. 도련 값과 실제 배경 채움, 최종 PDF의 재단·도련 박스를 별도로 확인하세요.");
+    out.coverage.push("객체는 경계가 겹치는 모든 아트보드에 기록합니다. 글자는 프레임 경계 기준 후보이며 실제 글자와 중요 로고의 재단 거리는 시각 확인이 필요합니다.");
+    out.coverage.push("인접 문자 중 같은 크기·채움·획·폰트 속성은 하나의 기록으로 묶습니다. 실제 문자 속성을 최대 30000자까지 읽습니다.");
+    out.coverage.push("글자 윤곽선, 폰트 누락·대체 상태 및 최종 PDF의 폰트 포함·임베딩 권한은 Illustrator 수집으로 인증하지 않습니다.");
+    out.coverage.push("래스터 효과 설정의 해상도는 배치 이미지 유효 PPI가 아닙니다. 래스터·링크 이미지 유효 PPI는 픽셀 수와 최종 배치 크기로 확인하세요.");
+    out.coverage.push("별색 목록은 스와치와 발견한 문자·경로 색상을 포함하며 사용 여부는 알 수 없습니다. 의도된 별색과 최종 분판을 확인하세요.");
+    out.coverage.push("직선 직사각형 경로가 모든 아트보드 변에서 5mm 이내인 경우만 외곽 테두리 후보입니다. 브러시·효과·확대 및 실제 출력 획 두께는 최종 PDF에서 확인하세요.");
+    out.coverage.push("그라디언트·패턴·메시·심볼·효과·배치 벡터 내부 및 비지원 객체는 수동 확인 대상입니다. 전체 파일의 RGB·별색 부재와 PDF/X 적합성을 인증하지 않습니다.");
+    return out;
+}

@@ -1,0 +1,396 @@
+/* InDesign read-only evidence collector. ES3 / ExtendScript compatible.
+ * Adobe DOM references (properties shared by the ExtendScript DOM):
+ * https://developer.adobe.com/indesign/uxp/dom/api/i/image/
+ * https://developer.adobe.com/indesign/uxp/dom/api/c/color/
+ * https://developer.adobe.com/indesign/uxp/dom/api/t/tint/
+ * https://developer.adobe.com/indesign/uxp/dom/api/f/font/
+ * https://developer.adobe.com/indesign/uxp/dom/api/s/script-preference/
+ * No document property, selection, link, font, or text is modified.
+ */
+function collectInDesign(doc) {
+    var out = { host: "InDesign", documentName: "", pages: [], items: [], texts: [], images: [], imageCoverageComplete: true, spots: [], fonts: [], extra: [], coverage: [] };
+    var caps = { pages: 2000, items: 20000, graphics: 10000, stories: 5000, ranges: 50000, swatches: 5000, fonts: 5000, links: 10000 };
+    var noteKeys = {}, coverageKeys = {}, spotKeys = {}, swatchNames = {}, pageLabelKeys = {}, pageEntries = [];
+    var omittedNotes = 0, totalRanges = 0, unitsReady = false, oldUnit, prefs = null, restoreUnit = false;
+    var colorSpaces = typeof ColorSpace !== "undefined" ? ColorSpace : null;
+    var colorModels = typeof ColorModel !== "undefined" ? ColorModel : null;
+    var fontStatuses = typeof FontStatus !== "undefined" ? FontStatus : null;
+    var linkStatuses = typeof LinkStatus !== "undefined" ? LinkStatus : null;
+    var pageSides = typeof PageSideOptions !== "undefined" ? PageSideOptions : null;
+    var nothing = typeof NothingEnum !== "undefined" ? NothingEnum : null;
+
+    function note(severity, message, key) {
+        key = "$" + (key || message);
+        if (noteKeys[key]) { return; }
+        noteKeys[key] = true;
+        if (out.extra.length < 150) { out.extra.push({ severity: severity, message: message }); }
+        else { omittedNotes++; }
+    }
+    function cover(message) {
+        var key = "$" + message;
+        if (!coverageKeys[key]) { coverageKeys[key] = true; out.coverage.push(message); }
+    }
+    function failed(label, key) {
+        note("확인 필요", label + ": 속성 또는 객체를 읽지 못했습니다. 해당 범위를 원본에서 확인하세요.", "read:" + (key || label));
+        cover(label + ": 읽지 못한 범위는 검사 완료에 포함하지 않습니다.");
+    }
+    function get(obj, prop, label, required) {
+        var value;
+        try {
+            if (obj === null || typeof obj === "undefined") { throw new Error("No object"); }
+            value = obj[prop];
+            if (typeof value === "undefined" && required) { failed(label || prop); }
+            return value;
+        } catch (e) { if (required) { failed(label || prop); } return undefined; }
+    }
+    function number(value) {
+        if (typeof value === "number" && isFinite(value)) { return value; }
+        if (typeof value === "string" && /^\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*$/.test(value)) {
+            var parsed = Number(value); return isFinite(parsed) ? parsed : null;
+        }
+        return null;
+    }
+    function point(value) {
+        if (!unitsReady) { return null; }
+        var n = number(value), match, multiplier;
+        if (n !== null) { return n; }
+        if (typeof value === "string") {
+            match = /^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(pt|mm|cm|in|pc)\s*$/i.exec(value);
+            if (match) {
+                multiplier = { pt: 1, mm: 72 / 25.4, cm: 72 / 2.54, "in": 72, pc: 12 }[match[2].toLowerCase()];
+                return Number(match[1]) * multiplier;
+            }
+        }
+        return null;
+    }
+    function string(value) { try { return String(value); } catch (e) { return ""; } }
+    function typeOf(obj) {
+        var reflected = get(obj, "reflect", "", false), name = reflected ? get(reflected, "name", "", false) : undefined;
+        if (name) { return string(name); }
+        var constructor = get(obj, "constructor", "", false);
+        return constructor ? string(get(constructor, "name", "", false) || "") : "";
+    }
+    function enumIs(value, group, name) {
+        if (group) {
+            try { if (typeof group[name] !== "undefined" && value === group[name]) { return true; } } catch (e) {}
+        }
+        var normalized = string(value).toUpperCase();
+        return normalized === name || normalized === name.replace(/_/g, " ") || normalized.slice(-(name.length + 1)) === "." + name;
+    }
+    function label(obj, fallback) {
+        var name = get(obj, "name", "", false), custom = get(obj, "label", "", false), id;
+        if (name && string(name)) { return string(name); }
+        if (custom && string(custom)) { return string(custom); }
+        id = get(obj, "id", "", false);
+        return fallback + (typeof id !== "undefined" ? " #" + string(id) : "");
+    }
+    function lengthOf(collection, context) {
+        var len = number(get(collection, "length", context, true));
+        if (len === null || len < 0 || Math.floor(len) !== len) { failed(context); return null; }
+        return len;
+    }
+    function at(collection, index, context) {
+        var item;
+        try {
+            item = collection[index];
+            if (typeof item === "undefined" && typeof collection.item === "function") { item = collection.item(index); }
+            if (typeof item === "undefined" || item === null || get(item, "isValid", "", false) === false) { throw new Error("Invalid item"); }
+            return item;
+        } catch (e) { failed(context + " #" + (index + 1)); return null; }
+    }
+    function scan(collection, context, limit, fn, imageScan) {
+        if (typeof collection === "undefined" || collection === null) { if (imageScan) { out.imageCoverageComplete = false; } failed(context); return; }
+        var len = lengthOf(collection, context), count, i, item;
+        if (len === null) { if (imageScan) { out.imageCoverageComplete = false; } return; }
+        count = Math.min(len, limit);
+        if (len > limit) {
+            if (imageScan) { out.imageCoverageComplete = false; }
+            note("확인 필요", context + ": 검사량 제한으로 " + count + "/" + len + "개만 읽었습니다. 나머지는 수동 확인하세요.", "cap:" + context);
+            cover(context + ": 검사량 제한 이후의 나머지 객체는 미검사입니다.");
+        }
+        for (i = 0; i < count; i++) {
+            item = at(collection, i, context);
+            if (item) { try { fn(item, i); } catch (e) { if (imageScan) { out.imageCoverageComplete = false; } failed(context + " #" + (i + 1)); } }
+            else if (imageScan) { out.imageCoverageComplete = false; }
+        }
+    }
+    function bounds(obj, prop, context) {
+        if (!unitsReady) { return null; }
+        var value = get(obj, prop, context, true), result = [], i, n;
+        if (!value || get(value, "length", "", false) !== 4) { failed(context); return null; }
+        for (i = 0; i < 4; i++) {
+            n = point(get(value, i, context, true));
+            if (n === null) { failed(context); return null; }
+            result.push(n);
+        }
+        if (result[2] < result[0] || result[3] < result[1]) { failed(context); return null; }
+        return result;
+    }
+    function unknownInk(name, context) {
+        failed(context || "색상 값"); return { space: "Unknown", values: [], name: name || "" };
+    }
+    function isNone(swatch) {
+        if (enumIs(swatch, nothing, "NOTHING")) { return true; }
+        var name = typeof swatch === "string" ? swatch : get(swatch, "name", "", false);
+        if (!name) { return false; }
+        name = string(name).replace(/^\$ID\//, "").replace(/^\[|\]$/g, "").toLowerCase();
+        return name === "none" || name === "없음" || name === "なし" || name === "ohne" || name === "sans" || name === "ninguno" || name === "nessuno" || name === "nenhum";
+    }
+    function addSpot(name) {
+        name = name || "이름 없는 별색";
+        if (!spotKeys["$" + name]) { spotKeys["$" + name] = true; out.spots.push({ name: name, used: null }); }
+    }
+    function inventorySpot(swatch, depth) {
+        var base = get(swatch, "baseColor", "", false), type = typeOf(swatch);
+        if (depth > 10) { failed("별색 틴트 기본색 연결"); return; }
+        if (type === "Tint" || typeof base !== "undefined") {
+            if (base) { inventorySpot(base, depth + 1); }
+            else { failed("별색 틴트 기본색"); }
+            return;
+        }
+        if (enumIs(get(swatch, "model", "", false), colorModels, "SPOT")) { addSpot(label(swatch, "이름 없는 별색")); }
+    }
+    function spaceOf(value) {
+        if (enumIs(value, colorSpaces, "CMYK") || /^cmyk$/i.test(string(value))) { return "CMYK"; }
+        if (enumIs(value, colorSpaces, "RGB") || /^(?:s?rgb)$/i.test(string(value))) { return "RGB"; }
+        if (enumIs(value, colorSpaces, "GRAY") || /^(?:gray|grey|grayscale|greyscale)$/i.test(string(value))) { return "Gray"; }
+        return "Unknown";
+    }
+    function ink(swatch, fraction, context, depth, originalName) {
+        var name, model, type, base, tint, space, values, expected, i, n, result = [];
+        if (isNone(swatch)) { return { space: "None", values: [], name: typeof swatch === "string" ? swatch : string(get(swatch, "name", "", false) || "None") }; }
+        if (!swatch || depth > 10) { return unknownInk(originalName, context + " (색상 또는 틴트 연결)"); }
+        if (typeof swatch === "string") {
+            if (swatchNames["$" + swatch]) { return ink(swatchNames["$" + swatch], fraction, context, depth + 1, originalName || swatch); }
+            return unknownInk(swatch, context + " (스와치 이름만 제공됨)");
+        }
+        name = string(get(swatch, "name", "", false) || "");
+        originalName = originalName || name;
+        model = get(swatch, "model", "", false);
+        if (enumIs(model, colorModels, "REGISTRATION") || /^\[?(?:registration|레지스트레이션|정합|レジストレーション)\]?$/i.test(name)) {
+            note("주의", context + ": 레지스트레이션(Registration) 잉크는 모든 분판에 출력될 수 있습니다. 일반 CMYK 글자색으로 판정하지 않습니다.", "registration:" + context);
+            return { space: "Unknown", values: [], name: originalName };
+        }
+        type = typeOf(swatch);
+        base = get(swatch, "baseColor", "", false);
+        if (type === "Tint" || typeof base !== "undefined") {
+            if (!base) { return unknownInk(originalName, context + " 틴트 기본색"); }
+            tint = number(get(swatch, "tintValue", context + " 틴트 농도", true));
+            if (tint === null || tint < 0 || tint > 100) { return unknownInk(originalName, context + " 틴트 농도"); }
+            return ink(base, fraction * tint / 100, context, depth + 1, originalName);
+        }
+        if (enumIs(model, colorModels, "SPOT")) {
+            addSpot(name); return { space: "Spot", values: [100 * fraction], name: name };
+        }
+        space = spaceOf(get(swatch, "space", context + " 색 공간", true));
+        if (space === "Unknown" || (type && type !== "Color" && type !== "Object")) {
+            cover("그라데이션·혼합 잉크·LAB 또는 미지원 색상은 원본과 최종 분판에서 추가 확인해야 합니다.");
+            return unknownInk(originalName, context + " (지원되지 않는 색 공간)");
+        }
+        values = get(swatch, "colorValue", context + " 잉크 값", true);
+        expected = space === "CMYK" ? 4 : (space === "RGB" ? 3 : 1);
+        if (!values || get(values, "length", "", false) !== expected) { return unknownInk(originalName, context + " 잉크 값"); }
+        for (i = 0; i < expected; i++) {
+            n = number(get(values, i, "", false));
+            if (n === null || n < 0 || n > (space === "RGB" ? 255 : 100)) { return unknownInk(originalName, context + " 잉크 값"); }
+            result.push(space === "RGB" ? 255 - ((255 - n) * fraction) : n * fraction);
+        }
+        return { space: space, values: result, name: originalName };
+    }
+    function paint(obj, which, context) {
+        var swatch = get(obj, which + "Color", context + " " + which + " 색상", true), tint;
+        if (isNone(swatch)) { return ink(swatch, 1, context, 0, ""); }
+        tint = number(get(obj, which + "Tint", context + " " + which + " 틴트 농도", true));
+        if (tint === null || tint < 0 || tint > 100) { return unknownInk("", context + " " + which + " 틴트 농도 (상속값 포함)"); }
+        return ink(swatch, tint / 100, context + " " + which, 0, "");
+    }
+    function pageFor(item) {
+        var p = get(item, "parentPage", "", false), id, i;
+        if (!p) { return null; }
+        id = get(p, "id", "", false);
+        for (i = 0; i < pageEntries.length; i++) {
+            if (p === pageEntries[i].object || (typeof id !== "undefined" && id === pageEntries[i].id)) { return pageEntries[i].data; }
+        }
+        return null;
+    }
+    function transformed(item, context) {
+        var h = number(get(item, "absoluteHorizontalScale", "", false));
+        var v = number(get(item, "absoluteVerticalScale", "", false));
+        var rotation = number(get(item, "absoluteRotationAngle", "", false));
+        var shear = number(get(item, "absoluteShearAngle", "", false));
+        if (h === null || v === null || rotation === null || shear === null || Math.abs(h - 100) > 0.001 || Math.abs(v - 100) > 0.001 || Math.abs(rotation % 180) > 0.001 || Math.abs(shear) > 0.001) {
+            note("확인 필요", context + ": 확대·축소 또는 회전·기울임 변환의 최종 획 두께와 테두리 위치를 수동 확인하세요.", "transform:" + context);
+            cover("확대·축소 또는 변환이 있거나 변환 API를 읽지 못한 테두리의 최종 획 두께는 자동 판정하지 않습니다.");
+            return true;
+        }
+        return false;
+    }
+    function readPages() {
+        var dp = get(doc, "documentPreferences", "문서 도련 설정", true), bleed = null, facing, t, b, inside, outside;
+        if (unitsReady && dp) {
+            t = point(get(dp, "documentBleedTopOffset", "위 도련", true));
+            b = point(get(dp, "documentBleedBottomOffset", "아래 도련", true));
+            inside = point(get(dp, "documentBleedInsideOrLeftOffset", "안쪽/왼쪽 도련", true));
+            outside = point(get(dp, "documentBleedOutsideOrRightOffset", "바깥쪽/오른쪽 도련", true));
+            if (t !== null && b !== null && inside !== null && outside !== null && Math.min(t, b, inside, outside) >= 0) { bleed = [t, inside, b, outside]; }
+            else { failed("문서 도련 값"); }
+        }
+        facing = get(dp, "facingPages", "페이지 마주보기 설정", true);
+        scan(get(doc, "pages", "문서 페이지", true), "문서 페이지", caps.pages, function (p, index) {
+            var data = { label: label(p, "페이지 " + (index + 1)), boundsPt: bounds(p, "bounds", "페이지 " + (index + 1) + " 경계"), bleedPt: bleed ? bleed.slice(0) : null };
+            var originalLabel = data.label, suffix = 0;
+            while (pageLabelKeys["$" + data.label]) {
+                data.label = originalLabel + " (문서 페이지 " + (index + 1) + (suffix ? ", " + suffix : "") + ")";
+                suffix++;
+            }
+            pageLabelKeys["$" + data.label] = true;
+            var side = get(p, "side", "", false);
+            if (bleed && facing === true) {
+                if (enumIs(side, pageSides, "LEFT_HAND")) { data.bleedPt = [bleed[0], bleed[3], bleed[2], bleed[1]]; }
+                else if (!enumIs(side, pageSides, "RIGHT_HAND") && !enumIs(side, pageSides, "SINGLE_SIDED")) { data.bleedPt = null; failed(data.label + " 안쪽/바깥쪽 도련 매핑"); }
+            } else if (bleed && typeof facing !== "boolean") { data.bleedPt = null; failed(data.label + " 도련 매핑"); }
+            out.pages.push(data); pageEntries.push({ object: p, id: get(p, "id", "", false), data: data });
+        });
+    }
+    function readItems() {
+        scan(get(doc, "allPageItems", "페이지 객체 allPageItems", true), "페이지 객체 allPageItems", caps.items, function (item, index) {
+            var type = typeOf(item), name = label(item, "객체 " + (index + 1)), page = pageFor(item), kind = "other", supportedPaint = false;
+            var geometry = bounds(item, "geometricBounds", name + " 경계"), weight = null, stroke = null, fill, candidate = false, i, near = true;
+            if (/^(TextFrame|EndnoteTextFrame|TextPath)$/.test(type)) { kind = "text"; supportedPaint = type !== "TextPath"; }
+            else if (/^(Rectangle|Oval|Polygon|GraphicLine)$/.test(type)) { kind = "shape"; supportedPaint = true; }
+            else if (/^(Image|PDF|EPS|SVG|ImportedPage|PICT|WMF)$/.test(type)) { kind = "image"; supportedPaint = true; }
+            if (kind === "shape") {
+                var graphics = get(item, "graphics", "", false);
+                if (graphics && number(get(graphics, "length", "", false)) > 0) { kind = "image"; }
+            }
+            if (!page) {
+                cover("페이지에 연결되지 않은 객체, 붙여넣기판 객체 및 마스터 페이지 객체의 재단 위치는 수동 확인해야 합니다.");
+                note("확인 필요", name + ": 문서 페이지에 연결된 위치를 확인하지 못했습니다.", "page:" + name);
+            }
+            if (supportedPaint) {
+                fill = paint(item, "fill", name);
+                if (fill.space === "RGB") { note("주의", name + ": 객체 채움에 RGB 색상이 있습니다. 최종 출력 변환과 분판을 확인하세요.", "rgbfill:" + name); }
+                if (fill.space === "Spot") { note("확인 필요", name + ": 객체 채움에 별색 " + fill.name + " 사용을 읽었습니다. 의도·후가공 용도와 인쇄소 사양을 확인하세요.", "spotfill:" + name); }
+                stroke = paint(item, "stroke", name);
+                weight = point(get(item, "strokeWeight", name + " 획 두께", true));
+                if (weight === null || weight < 0) { weight = null; failed(name + " 획 두께"); }
+                if (weight > 0 && stroke.space === "RGB") { note("주의", name + ": 객체 획에 RGB 색상이 있습니다. 최종 출력 변환과 분판을 확인하세요.", "rgbstroke:" + name); }
+                if (weight > 0 && stroke.space === "Spot") { note("확인 필요", name + ": 객체 획에 별색 " + stroke.name + " 사용을 읽었습니다. 의도·후가공 용도와 인쇄소 사양을 확인하세요.", "spotstroke:" + name); }
+                if (stroke.space === "None") { weight = 0; }
+            } else {
+                cover("그룹·지원되지 않는 객체의 실제 출력 외곽, 효과, 채움과 획은 원본에서 확인해야 합니다.");
+            }
+            if (type === "Rectangle" && weight > 0 && stroke && stroke.space !== "None" && stroke.space !== "Unknown" && page && page.boundsPt && geometry) {
+                for (i = 0; i < 4; i++) { if (Math.abs(geometry[i] - page.boundsPt[i]) > 5 * 72 / 25.4) { near = false; } }
+                if (near) { if (transformed(item, name)) { weight = null; } else { candidate = true; } }
+            }
+            out.items.push({ label: name, pageLabel: page ? page.label : "", boundsPt: geometry, kind: kind, strokePt: weight, borderCandidate: candidate });
+            if (kind === "text") {
+                var overflows = get(item, "overflows", name + " 넘친 텍스트", type !== "TextPath");
+                if (overflows === true) { note("주의", name + ": 프레임에 넘친 텍스트가 있습니다.", "oversetframe:" + name); }
+            }
+        });
+    }
+    function readTexts() {
+        scan(get(doc, "stories", "스토리", true), "스토리", caps.stories, function (story, storyIndex) {
+            var name = label(story, "스토리 " + (storyIndex + 1)), overflows = get(story, "overflows", name + " 넘친 텍스트", true);
+            if (overflows === true) { note("주의", name + ": 스토리에 넘친 텍스트가 있습니다.", "oversetstory:" + name); }
+            var remaining = Math.max(0, caps.ranges - totalRanges);
+            scan(get(story, "textStyleRanges", name + " 텍스트 범위", true), "텍스트 범위 " + name, remaining, function (range, index) {
+                totalRanges++;
+                var textLabel = name + " / 텍스트 범위 " + (index + 1), size = point(get(range, "pointSize", textLabel + " 글자 크기", true));
+                var fillInk = paint(range, "fill", textLabel), strokeWeight = point(get(range, "strokeWeight", textLabel + " 글자 획 두께", true));
+                var strokeInk = strokeWeight === 0 ? { space: "None", values: [], name: "None" } : paint(range, "stroke", textLabel);
+                if (size === null || size <= 0) { size = null; failed(textLabel + " 글자 크기"); }
+                if (strokeWeight === null || strokeWeight < 0) { failed(textLabel + " 글자 획 두께"); }
+                out.texts.push({ label: textLabel, sizePt: size, ink: fillInk, strokeInk: strokeInk });
+            });
+        });
+    }
+    function readGraphics() {
+        scan(get(doc, "allGraphics", "배치 그래픽 allGraphics", true), "배치 그래픽 allGraphics", caps.graphics, function (graphic, index) {
+            var name = label(graphic, "그래픽 " + (index + 1)), type = typeOf(graphic), ppi = null, space = "Unknown", raw, x, y;
+            if (type === "Image") {
+                raw = get(graphic, "effectivePpi", name + " 유효 PPI", true);
+                if (raw && get(raw, "length", "", false) === 2) {
+                    x = number(get(raw, 0, "", false)); y = number(get(raw, 1, "", false));
+                    if (x !== null && y !== null && x > 0 && y > 0) { ppi = [x, y]; }
+                } else {
+                    x = number(raw); if (x !== null && x > 0) { ppi = [x, x]; }
+                }
+                if (!ppi) { out.imageCoverageComplete = false; failed(name + " 유효 PPI"); }
+                space = spaceOf(get(graphic, "space", name + " 이미지 색 공간", true));
+                if (space === "Unknown") { out.imageCoverageComplete = false; failed(name + " 이미지 색 공간"); }
+            } else {
+                out.imageCoverageComplete = false;
+                note("확인 필요", name + ": " + (type || "미지원 그래픽") + " 내부 이미지의 해상도·색상은 이 수집기로 확인하지 못합니다.", "graphic:" + name);
+                cover("PDF·EPS·SVG 및 미지원 배치 그래픽 내부의 글자·벡터·이미지 색상과 해상도는 별도로 확인해야 합니다.");
+            }
+            out.images.push({ label: name, ppi: ppi, space: space });
+        }, true);
+    }
+    function readFonts() {
+        scan(get(doc, "fonts", "문서 폰트", true), "문서 폰트", caps.fonts, function (font, index) {
+            var name = label(font, "폰트 " + (index + 1)), raw = get(font, "status", name + " 폰트 상태", true), status = "unknown";
+            var embed = get(font, "allowPDFEmbedding", name + " PDF 폰트 포함 허용", true);
+            if (enumIs(raw, fontStatuses, "INSTALLED")) { status = "installed"; }
+            else if (enumIs(raw, fontStatuses, "NOT_AVAILABLE") || enumIs(raw, fontStatuses, "SUBSTITUTED") || enumIs(raw, fontStatuses, "FAUXED")) { status = "missing"; }
+            if (status === "missing") { note("주의", name + ": 폰트가 누락되었거나 대체·합성되었습니다.", "font:" + name); }
+            if (status === "unknown") { failed(name + " 폰트 상태"); }
+            if (typeof embed !== "boolean") { embed = null; failed(name + " PDF 폰트 포함 허용"); }
+            out.fonts.push({ name: name, status: status, embedAllowed: embed });
+        });
+    }
+    function readLinks() {
+        scan(get(doc, "links", "문서 링크", true), "문서 링크", caps.links, function (link, index) {
+            var name = label(link, "링크 " + (index + 1)), status = get(link, "status", name + " 링크 상태", true);
+            if (enumIs(status, linkStatuses, "LINK_MISSING")) { note("주의", name + ": 링크 파일이 누락되었습니다.", "link:" + name); }
+            else if (enumIs(status, linkStatuses, "LINK_OUT_OF_DATE")) { note("주의", name + ": 링크 파일이 변경되어 문서의 배치 내용이 최신 상태인지 확인해야 합니다.", "link:" + name); }
+            else if (enumIs(status, linkStatuses, "LINK_INACCESSIBLE")) { note("주의", name + ": 링크 파일에 접근할 수 없습니다.", "link:" + name); }
+            else if (!enumIs(status, linkStatuses, "NORMAL") && !enumIs(status, linkStatuses, "LINK_EMBEDDED")) { failed(name + " 링크 상태"); }
+        });
+    }
+
+    cover("글자 안전 여백은 텍스트 프레임 경계의 후보 거리입니다. 글자 윤곽·실제 글리프와 중요도를 수동 확인해야 합니다.");
+    cover("로고·아웃라인 글자·이미지 안의 글자, 숨김/비인쇄 객체, 마스크·효과 및 배경이 도련 끝까지 채워졌는지는 수동 확인해야 합니다.");
+    cover("배치 비트맵은 Image.effectivePpi와 Image.space를 읽습니다. 최종 PDF 변환·재표본화·분판 결과는 별도 확인해야 합니다.");
+    cover("별색 스와치 목록은 미사용 스와치를 포함할 수 있으며 사용 여부와 별색 의도를 확정하지 않습니다.");
+    cover("스토리의 기본 텍스트 스타일 범위를 읽습니다. 표·각주·후주·문단 음영/테두리·장식선·조건부/숨김 텍스트 및 마스터의 실제 출력은 별도 확인해야 합니다.");
+    cover("Font.allowPDFEmbedding은 포함 허용 여부입니다. 실제 최종 PDF의 폰트 포함 상태는 별도 확인해야 합니다.");
+    try {
+        if (!doc || get(doc, "isValid", "", false) === false) { out.imageCoverageComplete = false; failed("활성 InDesign 문서"); return out; }
+        out.documentName = label(doc, "이름 없는 InDesign 문서");
+        try {
+            prefs = app.scriptPreferences;
+            oldUnit = prefs.measurementUnit;
+            if (typeof oldUnit === "undefined") { throw new Error("Unknown original measurement unit"); }
+            restoreUnit = true;
+            prefs.measurementUnit = MeasurementUnits.POINTS;
+            unitsReady = prefs.measurementUnit === MeasurementUnits.POINTS;
+            if (!unitsReady) { throw new Error("Point unit was not applied"); }
+        } catch (e) { note("확인 필요", "스크립트 측정 단위를 pt로 확인하지 못했습니다. 경계·도련·글자 크기·획 두께는 자동 판정하지 않습니다.", "units"); }
+        readPages();
+        scan(get(doc, "swatches", "문서 스와치", true), "문서 스와치", caps.swatches, function (swatch, index) {
+            var name = label(swatch, "스와치 " + (index + 1));
+            swatchNames["$" + name] = swatch;
+            inventorySpot(swatch, 0);
+        });
+        var masters = get(doc, "masterSpreads", "마스터 페이지 범위", true);
+        var masterCount = masters ? lengthOf(masters, "마스터 페이지 범위") : null;
+        if (masterCount === null) { out.imageCoverageComplete = false; }
+        if (masterCount > 0) {
+            out.imageCoverageComplete = false;
+            cover("마스터 페이지 객체의 실제 적용·출력 위치와 마스터 텍스트/이미지는 자동 검사 범위 밖이며 문서 페이지별로 수동 확인해야 합니다.");
+            note("확인 필요", "마스터 페이지가 있습니다. 상속 객체의 실제 적용·출력과 위치는 문서 페이지별로 수동 확인하세요.", "masters");
+        }
+        readItems(); readTexts(); readGraphics(); readFonts(); readLinks();
+    } catch (e) { out.imageCoverageComplete = false; failed("InDesign 수집 중단"); }
+    finally {
+        if (restoreUnit && prefs) {
+            try { prefs.measurementUnit = oldUnit; }
+            catch (e) { note("확인 필요", "원래 스크립트 측정 단위를 복원하지 못했습니다. 앱의 스크립트 환경 설정을 확인하세요.", "restore"); }
+        }
+        if (omittedNotes > 0) { out.extra.push({ severity: "확인 필요", message: "보고서 표시량 제한으로 추가 경고 " + omittedNotes + "개를 생략했습니다. 원본의 전체 Preflight 결과를 확인하세요." }); cover("경고 표시량 제한 이후의 세부 결과는 이 보고서에 포함되지 않습니다."); }
+    }
+    return out;
+}

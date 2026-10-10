@@ -1,0 +1,114 @@
+/* ES3: host-independent print rules. Unknown evidence never becomes a pass. */
+function evaluatePreflight(s, job) {
+    var MM = 72 / 25.4, i, j, a, ink, v, p, d, n;
+    function valid(x, allowZero) { return typeof x === 'number' && isFinite(x) && (allowZero ? x >= 0 : x > 0); }
+    if (!valid(job.safetyMm, true) || !valid(job.minPpi, false) ||
+        (job.bleedMm !== null && !valid(job.bleedMm, true)) ||
+        (job.smallTextPt !== null && !valid(job.smallTextPt, false))) throw Error('점검 기준에 올바른 숫자를 입력해 주세요.');
+    var titles = ['재단 안전 여백', '도련과 배경 채움', '재단 주변 테두리', '작은 검정·회색 글자', '리치블랙', '글꼴과 윤곽선', '이미지 색상·해상도', '별색과 RGB'];
+    var r = {version:'1.0.0',complete:false,host:s.host,documentName:s.documentName,job:job,rules:[],coverage:s.coverage || [],extra:s.extra || []};
+    for (i=0;i<titles.length;i++) r.rules.push({number:i+1,title:titles[i],status:'확인 필요',details:[]});
+    function add(index, status, msg) {
+        var rule=r.rules[index];
+        if (status==='주의' || rule.status!=='주의') rule.status=status;
+        rule.details.push(msg);
+    }
+    function has(arr, x) { for(var k=0;k<arr.length;k++) if(arr[k]===x) return true; return false; }
+    function cm(ink) { return ink && ink.space==='CMYK' && ink.values && ink.values.length===4; }
+    function loc(a) { return a.label || '위치 미상'; }
+    var items=s.items || [], texts=s.texts || [], images=s.images || [], pages=s.pages || [], fonts=s.fonts || [], spots=s.spots || [];
+    add(0,'확인 필요','글자 프레임과 중요 객체 후보를 재단선 안쪽 '+job.safetyMm+'mm 기준으로 비교합니다. 글자·로고의 실제 외곽과 중요도는 직접 확인해 주세요.');
+    for (i=0;i<items.length;i++) {
+        a=items[i]; if (a.kind!=='text' || !a.boundsPt) continue;
+        for(j=0;j<pages.length;j++) if(pages[j].label===a.pageLabel) {
+            p=pages[j].boundsPt; d=a.boundsPt;
+            if(!p || p.length!==4) {add(0,'확인 필요',pages[j].label+': 재단 좌표 미확인.');continue;}
+            n=Math.min(d[0]-p[0],d[1]-p[1],p[2]-d[2],p[3]-d[3])/MM;
+            if(isFinite(n) && n<job.safetyMm-0.01) add(0,'주의',loc(a)+': 안전 여백을 벗어난 프레임 후보, 최소 '+n.toFixed(2)+'mm. 실제 글자 외곽을 확인하세요.');
+        }
+    }
+    add(1,'확인 필요',job.bleedMm===null?'인쇄소 도련 폭 미입력. 원문에는 도련 폭 숫자가 없습니다.':'인쇄소 도련 기준: '+job.bleedMm+'mm.');
+    add(1,'확인 필요','문서 도련 설정만으로 배경이 작업선까지 채워졌음을 보장하지 않습니다. 배경·전면 그래픽을 확인하세요.');
+    for(i=0;i<pages.length;i++) {
+        p=pages[i];
+        if(!p.bleedPt) {add(1,'확인 필요',p.label+': 도련 값을 읽을 수 없습니다.');continue;}
+        a=[]; for(j=0;j<4;j++) a.push((p.bleedPt[j]/MM).toFixed(2));
+        add(1,'확인 필요',p.label+': 도련 위/왼쪽/아래/오른쪽 '+a.join('/')+'mm.');
+        if(job.bleedMm!==null) for(j=0;j<4;j++) if(p.bleedPt[j]/MM<job.bleedMm-0.01) {add(1,'주의',p.label+': 설정된 도련이 인쇄소 기준보다 작습니다.');break;}
+    }
+    add(2,'확인 필요','재단 주변 테두리에만 3mm 권고를 적용합니다. 장식선·내부 선은 이 기준으로 판정하지 않습니다.');
+    for(i=0;i<items.length;i++) if(items[i].borderCandidate) {
+        a=items[i];
+        if(valid(a.strokePt,false)) {
+            n=a.strokePt/MM;
+            add(2,n<3-0.01?'주의':'확인 필요',loc(a)+': 외곽 테두리 후보 '+n.toFixed(2)+'mm. 실제 테두리 여부와 최종 출력 두께를 확인하세요.');
+        } else add(2,'확인 필요',loc(a)+': 외곽 테두리 후보의 최종 획 두께 미확인.');
+    }
+    add(3,'확인 필요',job.smallTextPt===null?'작은 글자 pt 기준 미입력. 원문에 pt 경계가 없으므로 임의로 정하지 않습니다.':'작은 글자 기준: '+job.smallTextPt+'pt 이하 (사용자 지정).');
+    add(3,'확인 필요','검정 의도인 작은 글자는 K100, 회색은 K 단색인지 확인하세요. 색의 용도·얇은 획·최종 분판은 직접 확인합니다.');
+    add(4,'확인 필요','잉크 건조·뒷묻음·페이지 간 색상 차이는 인쇄소와 확인하세요. C30/K100은 원문 예시이며 권장 배합이 아닙니다.');
+    for(i=0;i<texts.length;i++) {
+        a=texts[i]; var inks=[a.ink,a.strokeInk];
+        for(j=0;j<inks.length;j++) {
+            ink=inks[j]; if(!ink || ink.space==='None') continue;
+            if(cm(ink)) {
+                v=ink.values;
+                if(v[0]===0 && v[1]===0 && v[2]===0 && v[3]>0 && v[3]<=10)
+                    add(3,'주의',loc(a)+': K'+v[3]+'의 옅은 글자 후보. 작은·얇은 글자는 선명도 확인.');
+                if(v[3]>0 && (v[0]>0 || v[1]>0 || v[2]>0)) {
+                    add(3,job.smallTextPt!==null && valid(a.sizePt,false) && a.sizePt<=job.smallTextPt?'주의':'확인 필요',loc(a)+': C/M/Y/K '+v.join('/')+' 혼합 잉크 글자. 검정·회색 의도인지 확인.');
+                    if(v[3]>=99.9) add(4,'주의',loc(a)+': 리치블랙 후보 C/M/Y/K '+v.join('/')+'. 작은 글자의 핀 어긋남을 확인하세요.');
+                }
+            } else if(ink.space!=='RGB') add(3,'확인 필요',loc(a)+': '+ink.space+' 글자 색을 K 분판으로 확인하세요.');
+            if(ink.space==='RGB') add(7,'주의',loc(a)+': RGB 글자 색 검출. 인쇄소 출력 변환과 최종 색을 확인하세요.');
+            if(ink.space==='Spot') {
+                n=has(job.allowedSpots || [],ink.name);
+                add(7,n?'확인 필요':'주의',loc(a)+': 별색 '+ink.name+(n?' (지정된 별색).':' 사용. 의도·후가공 용도를 확인하세요.'));
+            }
+        }
+    }
+    add(5,'확인 필요',job.delivery==='pdf'?'최종 PDF의 글꼴 포함과 렌더링을 확인하세요. 모든 PDF 글자를 일괄 윤곽선으로 만들 필요는 없습니다.':'PDF 외 원본 납품: 인쇄소의 글꼴·윤곽선 요구를 확인하세요.');
+    if(job.delivery==='singleOriginal' && texts.length>0) add(5,'주의','PDF 외 낱장 표지·명함 납품: 편집 가능한 글자가 있습니다. 원문 윤곽선 권고를 확인하세요.');
+    for(i=0;i<fonts.length;i++) {
+        a=fonts[i];
+        if(a.status==='missing') add(5,'주의','누락·대체 가능 글꼴: '+a.name+'.');
+        if(a.embedAllowed===false) add(5,'주의','PDF 포함 제한 글꼴: '+a.name+'.');
+        if(a.status==='unknown') add(5,'확인 필요','사용 글꼴 '+a.name+': 설치·대체 상태 미확인.');
+    }
+    if(images.length===0) add(6,'확인 필요','자동 수집된 래스터 이미지 없음. 포함된 PDF·EPS·심볼 등 내부 이미지는 별도로 확인하세요.');
+    else {
+        r.rules[6].status='확인됨';
+        add(6,'확인됨','수집된 이미지 '+images.length+'건을 유효 PPI '+job.minPpi+'·CMYK 기준으로 비교합니다. 내보낸 PDF의 재표본화와 미지원 객체는 별도 확인.');
+        var unknownImage=false;
+        for(i=0;i<images.length;i++) {
+            a=images[i]; var status='확인됨';
+            if(!a.ppi || a.ppi.length<2 || !valid(a.ppi[0],false) || !valid(a.ppi[1],false)) {status='확인 필요';unknownImage=true;}
+            else if(Math.min(a.ppi[0],a.ppi[1])<job.minPpi) status='주의';
+            if(a.space==='RGB') status='주의';
+            else if(a.space!=='CMYK') {unknownImage=true;if(status!=='주의') status='확인 필요';}
+            add(6,status,loc(a)+': '+a.space+', 유효 PPI '+(a.ppi?a.ppi.join(' × '):'미확인')+'.');
+        }
+        if(unknownImage && r.rules[6].status!=='주의') r.rules[6].status='확인 필요';
+        if(s.imageCoverageComplete===false) add(6,'확인 필요','이미지 또는 포함 그래픽 중 자동 검사하지 못한 범위가 있습니다. 전체 이미지 조건을 확인해 주세요.');
+    }
+    add(7,'확인 필요','사용 별색의 의도, 포함 그래픽 내부, 출력 색상 변환·분판을 확인하세요. 미사용 견본은 실제 사용의 증거가 아닙니다.');
+    for(i=0;i<spots.length;i++) {
+        a=spots[i]; n=has(job.allowedSpots || [],a.name);
+        add(7,a.used===true && !n?'주의':'확인 필요',a.name+': '+(a.used===true?'사용 검출':a.used===false?'미사용 견본':'견본 있음, 사용 여부 미확인')+(n?' / 지정 별색':' / 의도 확인')+'.');
+    }
+    return r;
+}
+function preflightReportText(r) {
+    var lines=['LAYA 인쇄 점검 v'+r.version,r.host+' — '+r.documentName,'원본의 부분 점검 결과 / 최종 인쇄 파일 인증 아님','',
+        '기준: 안전 여백 '+r.job.safetyMm+'mm, 최소 '+r.job.minPpi+'PPI, 도련 '+(r.job.bleedMm===null?'미입력':r.job.bleedMm+'mm')+', 작은 글자 '+(r.job.smallTextPt===null?'미입력':r.job.smallTextPt+'pt'),
+        '납품 방식: '+r.job.delivery,'지정 별색: '+((r.job.allowedSpots || []).join(', ') || '미입력'),''];
+    var i,j,a;
+    for(i=0;i<r.rules.length;i++) {a=r.rules[i];lines.push(a.number+'. '+a.title+' — '+a.status);for(j=0;j<a.details.length;j++) lines.push('  '+a.details[j]);lines.push('');}
+    lines.push('추가 점검');
+    for(i=0;i<r.extra.length;i++) lines.push('['+r.extra[i].severity+'] '+r.extra[i].message);
+    for(i=0;i<r.coverage.length;i++) lines.push('[확인 필요] '+r.coverage[i]);
+    lines.push('최종 PDF의 도련 채움, 글꼴 포함, 분판, 인쇄소 사양을 별도로 확인하세요.', '',
+        '기준 출처: 길벗 「인쇄할 때 꼭 알아야 하는 주의사항 8가지!!」',
+        'https://blog.naver.com/gilbutzigy/223785925614');
+    return lines.join('\n');
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "LAYA 인쇄 파일 점검"
+  short_description: "길벗의 8가지 인쇄 유의사항으로 원본과 최종 PDF를 점검합니다"
+  default_prompt: "$laya-print-preflight를 사용해 이 인쇄 파일을 길벗의 8가지 유의사항으로 점검하고 근거와 필요한 수정 사항을 알려줘."
